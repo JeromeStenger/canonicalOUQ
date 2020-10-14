@@ -49,7 +49,7 @@ def QD_Algorithm(c):
 
 def Canonical_to_Position(lower, upper, p):
     '''
-    Convert a sequence of Canonical Moment to the correponding discrete measure, 
+    Convert a sequence of Canonical Moment to the correponding discrete measure,
     return the positions and weights of the measure,
     Number of points is int((len(p)-1)/2)+1
     '''
@@ -119,7 +119,7 @@ def LHSdesign(Z, Wgt, mode, N):
 def CostFunction(func, p, m, lower, upper, N, mode, threshold, design, MinMax):
     '''
     Return the probability of failure correponding to the sequence of Canonical
-    in the general case where the input distribution can be continuous. 
+    in the general case where the input distribution can be continuous.
     Should be used with the NoisyDE solver.
     '''
     dim = len(lower)
@@ -137,7 +137,7 @@ def CostFunction(func, p, m, lower, upper, N, mode, threshold, design, MinMax):
     NewMom = [[]]*dim
     m_copy = m.copy()
     for i in range(dim):
-        if mode[i] != None:
+        if mode[i] is not None:
             m_copy[i] = np.append([1], m_copy[i])
             NewMom[i] = [(j+1)*m_copy[i][j] - (j)*mode[i]*m_copy[i][j-1] for j in range(1, len(m_copy[i]))]
             Z[i], Wgt[i] = Canonical_to_Position([lower[i]], [upper[i]], QD_Algorithm(Affine_Transformation(lower[i], upper[i], NewMom[i])) + pp[i])
@@ -148,7 +148,7 @@ def CostFunction(func, p, m, lower, upper, N, mode, threshold, design, MinMax):
         if design == 'MC':
             PERT = []
             for i in range(dim):
-                if mode[i] != None:
+                if mode[i] is not None:
                     U = []
                     for j in range(len(m[i])+1):
                         U.append(ot.Uniform(float(min(mode[i], Z[i][j])), float(max(mode[i], Z[i][j]))))
@@ -167,7 +167,6 @@ def CostFunction(func, p, m, lower, upper, N, mode, threshold, design, MinMax):
             return MinMax*sum(func(Sample) <= threshold)/N
     else:
         return 1
-
 
 
 def DiscreteCostFunction(func, p, m, lower, upper, threshold, MinMax):
@@ -225,6 +224,95 @@ def Optim(func, threshold, constraints, McNumber=5000, design='MC', MinMax=1, **
     else:
         solved, func_max, func_evals = DE_Noisy(CostSolver, xmin, xmax, **kwargs)
         return solved, MinMax*func_max, func_evals
+
+
+# =============================================================================
+# ======================= SOBOL INDICES OPTIMIZATION===========================
+# =============================================================================
+
+
+def CostSobol(MyModel, p, m, lower, upper, distribution, indexNumber, indexChoice, NSobol, MINMAX):
+    '''
+    Return the associated sobol index to the measure recovered from the canonical moment sequences
+    '''
+    dim = len(lower)
+    # We concatenate p per block of variable
+    if len(m) == dim:
+        pp = []
+        t = 0
+        for i in range(dim):
+            pp.append(p[t:t+len(m[i])+1])
+            t = t + len(m[i])+1
+    else:
+        print('error size of moment vector')
+
+    if indexChoice == 1:
+        P = list(QD_Algorithm(Affine_Transformation(lower[indexNumber], upper[indexNumber], m[indexNumber]))) + list(pp[indexNumber])
+        Position, Weight = Canonical_to_Position([lower[indexNumber]], [upper[indexNumber]], P)
+
+        distribution[indexNumber] = ot.Mixture([ot.Dirac(Position[i]) for i in range(len(Position))], Weight)
+        composedDistribution = ot.ComposedDistribution(distribution)
+        ot.RandomGenerator.SetSeed(0)
+        inputDesign = ot.SobolIndicesExperiment(composedDistribution, NSobol, True).generate()
+        outputDesign = MyModel(inputDesign)
+
+        sensitivityAnalysis = ot.SaltelliSensitivityAlgorithm(inputDesign, outputDesign, NSobol)
+        firstOrder = sensitivityAnalysis.getFirstOrderIndices()
+        return MINMAX*firstOrder[indexNumber]
+
+    elif indexChoice == 0:
+        t = 0
+        P = [[]]*(dim-1)
+        Position = [[]]*(dim-1)
+        Weight = [[]]*(dim-1)
+        for i in range(dim):
+            if i != indexNumber:
+                P[t] = list(QD_Algorithm(Affine_Transformation(lower[i], upper[i], m[i]))) + list(pp[i])
+                Position[t], Weight[t] = Canonical_to_Position([lower[i]], [upper[i]], P[t])
+                distribution[i] = ot.Mixture([ot.Dirac(Position[t][j]) for j in range(len(Position[t]))], Weight[t])
+                t += 1
+        composedDistribution = ot.ComposedDistribution(distribution)
+        ot.RandomGenerator.SetSeed(0)
+        inputDesign = ot.SobolIndicesExperiment(composedDistribution, NSobol, True).generate()
+        outputDesign = MyModel(inputDesign)
+
+        sensitivityAnalysis = ot.SaltelliSensitivityAlgorithm(inputDesign, outputDesign, NSobol)
+        totalOrder = sensitivityAnalysis.getTotalOrderIndices()
+        return MINMAX*totalOrder[indexNumber]
+
+
+def OptimSobol(model, distribution, indexNumber, constraints, indexChoice=1, solver='DE', NSobol=100000, MINMAX=1, **kwargs):
+    '''
+    Run the optimisation, return the argmin,
+    the min and the number of evaluation of the function.
+
+    The DE solver can take the following parameters:
+        - npop = 40    # population size
+        - maxiter = 1000,  # max number of population generation
+        - maxfun = 1e+6,   # max number of function call
+        - convergence_tol = 1e-5,   # tolerence criteria
+        - ngen = 100,    # number of generation required to stop convergence
+        - crossover = 0.9,
+        - percent_change = 0.9,
+        - MINMAX = 1,    # 1 for minimum search, -1 for maximum
+        - x0 = [],    # initial point
+        - radius = 0.1   # if x0 non zero, relative ball size centered in x0
+        - nodes = 16    # Number of nodes for parallelization
+    '''
+    lower = constraints.Lower()
+    upper = constraints.Upper()
+
+    def Cost_Solver(mp):
+        mode, moment = constraints.Get_Moment_Constraint_Vector(mp)
+        p = constraints.Get_Canonical_Moment_Vector(mp)
+        return CostSobol(model, p, moment, lower, upper, distribution, indexNumber, indexChoice, NSobol, MINMAX)
+
+    xmin, xmax = constraints.Create_Optim_Bounds()
+
+    solved, func_max, func_evals = eval('optimize' + solver + '(Cost_Solver, xmin, xmax, **kwargs)')
+    print('\n max S', indexNumber, ' = ', round(func_max, 4))
+    return solved, func_max, func_evals
+
 
 # =============================================================================
 # ======================== CLASS OF CONSTRAINT ================================
